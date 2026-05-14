@@ -213,6 +213,100 @@ def multi_stage_retrieval(query, hybrid_retriever, reranker=None, use_rerank=Fal
     return unique_docs
 
 
+def check_relevance(query, docs, threshold=0.5):
+    """
+    检查检索结果与查询的相关性
+
+    Args:
+        query: 用户查询
+        docs: 检索到的文档列表
+        threshold: 相关性阈值（0-1），越高要求越严格
+
+    Returns:
+        bool: 是否相关
+        float: 最高相似度分数
+    """
+    if not docs:
+        return False, 0.0
+
+    # 获取第一个（最相关的）文档
+    top_doc = docs[0]
+
+    # 如果有score属性，直接使用
+    if hasattr(top_doc, 'metadata') and 'score' in top_doc.metadata:
+        score = top_doc.metadata['score']
+        return score >= threshold, score
+
+    # 否则通过嵌入模型计算相似度
+    try:
+        # 计算查询和文档的嵌入向量
+        query_embedding = embeddings_model.embed_query(query)
+        doc_embedding = embeddings_model.embed_documents([top_doc.page_content])[0]
+
+        # 计算余弦相似度
+        import numpy as np
+        query_vec = np.array(query_embedding)
+        doc_vec = np.array(doc_embedding)
+
+        similarity = np.dot(query_vec, doc_vec) / (np.linalg.norm(query_vec) * np.linalg.norm(doc_vec))
+
+        return similarity >= threshold, float(similarity)
+    except Exception as e:
+        print(f"相似度计算失败: {e}")
+        # 默认认为相关，避免误判
+        return True, 1.0
+
+
+def generate_answer_with_relevance_check(query, relevant_docs, threshold=0.5):
+    """
+    带相关性检查的答案生成
+
+    Args:
+        query: 用户查询
+        relevant_docs: 检索到的相关文档
+        threshold: 相关性阈值
+
+    Returns:
+        str: 回答内容
+    """
+    # 如果没有检索到文档
+    if not relevant_docs:
+        return "抱歉，我在知识库中没有找到相关信息来回答您的问题。"
+
+    # 检查相关性
+    is_relevant, similarity_score = check_relevance(query, relevant_docs, threshold)
+
+    print(f"\n📊 相关性分析:")
+    print(f"   - 最高相似度: {similarity_score:.4f}")
+    print(f"   - 阈值设定: {threshold}")
+    print(f"   - 判断结果: {'✅ 相关' if is_relevant else '❌ 不相关'}")
+
+    if not is_relevant:
+        return f"抱歉，您的问题与知识库中的内容关联度较低（相似度: {similarity_score:.2%}），我可能无法给出准确的回答。建议您：\n1. 换一种提问方式\n2. 询问与法律相关的问题\n3. 提供更具体的关键词"
+
+    # 创建prompt模板（添加相关性指令）
+    template = """请根据下面给出的上下文来回答问题。如果上下文与问题无关，请明确说明。
+
+上下文:
+{context}
+
+问题: {question}
+
+请基于上述上下文提供准确的回答。如果上下文不足以回答问题，请诚实地告知用户。
+回答:"""
+
+    # 由模板生成prompt
+    prompt = ChatPromptTemplate.from_template(template)
+
+    # 创建chain
+    chain = RunnableMap({
+        "context": lambda x: "\n\n".join([doc.page_content for doc in relevant_docs[:2]]),  # 使用前2个最相关文档
+        "question": lambda x: x["question"]
+    }) | prompt | client | StrOutputParser()
+
+    return chain.invoke({"question": query})
+
+
 # 交互式查询
 while True:
     user_query = input("\n请输入您的问题: ").strip()
@@ -242,21 +336,7 @@ while True:
     print("=" * 50)
     print("=" * 50)
 
-    # 调用大模型
-    # 创建prompt模板
-    template = """请根据下面给出的上下文来回答问题:
-    {context}
-    问题: {question}
-    """
-
-    # 由模板生成prompt
-    prompt = ChatPromptTemplate.from_template(template)
-
-    # 创建chain
-    chain = RunnableMap({
-        "context": lambda x: relevant_docs[0], # 取第一个结果
-        "question": lambda x: x["question"]
-    }) | prompt | client | StrOutputParser()
-
-    print("------------向量检索+BM25 -> 大模型回答------------------------")
-    print(chain.invoke({"question": user_query}))
+    # 带相关性检查的答案生成
+    print("\n------------向量检索+BM25 -> 相关性检查 -> 大模型回答------------------------")
+    answer = generate_answer_with_relevance_check(user_query, relevant_docs, threshold=0.5)
+    print(answer)
